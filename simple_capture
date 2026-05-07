@@ -1,1 +1,70 @@
-s
+bool motion_event = motion_score > MOTION_THRESHOLD;
+bool imu_event = accel_mag > ACCEL_THRESHOLD;
+
+/*
+ * Live preview window.
+ * We draw on a copy so the saved event frame stays clean.
+ */
+cv::Mat preview = frame.clone();
+
+cv::putText(preview,
+            "AI Dashcam Prototype",
+            cv::Point(20, 30),
+            cv::FONT_HERSHEY_SIMPLEX,
+            0.8,
+            cv::Scalar(0, 255, 0),
+            2);
+
+cv::putText(preview,
+            "Motion: " + std::to_string(motion_score),
+            cv::Point(20, 65),
+            cv::FONT_HERSHEY_SIMPLEX,
+            0.7,
+            cv::Scalar(0, 255, 255),
+            2);
+
+cv::putText(preview,
+            "Accel: " + std::to_string(accel_mag) + " g",
+            cv::Point(20, 100),
+            cv::FONT_HERSHEY_SIMPLEX,
+            0.7,
+            cv::Scalar(255, 255, 0),
+            2);
+
+std::string imu_status = imu_ok ? "IMU: BMI270 OK" : "IMU: NOT VERIFIED";
+
+cv::putText(preview,
+            imu_status,
+            cv::Point(20, 135),
+            cv::FONT_HERSHEY_SIMPLEX,
+            0.7,
+            cv::Scalar(255, 255, 255),
+            2);
+
+cv::putText(preview,
+            "Press m = trigger event, q = quit",
+            cv::Point(20, 170),
+            cv::FONT_HERSHEY_SIMPLEX,
+            0.6,
+            cv::Scalar(255, 255, 255),
+            2);
+
+cv::imshow("Dashcam Live Preview", preview);
+
+int key = cv::waitKey(1);
+
+if (key == 'q' || key == 'Q')
+{
+    std::cout << "User quit preview\n";
+    break;
+}
+
+bool keyboard_manual_event = (key == 'm' || key == 'M');
+bool manual_event = (manual_trigger && frame_count == 20) || keyboard_manual_event;
+
+std::cout << "frame=" << frame_count
+          << " motion=" << motion_score
+          << " accel=" << accel_mag
+          << "\n";
+
+if (motion_event || imu_event || manual_event)
