@@ -1,75 +1,14 @@
-bool read_i2c_registers(unsigned char start_reg,
-                        unsigned char* data,
-                        int length)
+double ax = 0.0;
+double ay = 0.0;
+double az = 0.0;
+
+bool accel_ok = read_real_accel(ax, ay, az);
+
+if (!accel_ok)
 {
-    int fd = open(I2C_DEVICE, O_RDWR);
+    std::cout << "Real accel read failed, using fallback values\n";
 
-    if (fd < 0)
-    {
-        std::cout << "Failed to open I2C device for accel read\n";
-        return false;
-    }
-
-    if (ioctl(fd, I2C_SLAVE, IMU_ADDRESS) < 0)
-    {
-        std::cout << "Failed to select IMU address for accel read\n";
-        close(fd);
-        return false;
-    }
-
-    if (write(fd, &start_reg, 1) != 1)
-    {
-        std::cout << "Failed to write accel start register\n";
-        close(fd);
-        return false;
-    }
-
-    if (read(fd, data, length) != length)
-    {
-        std::cout << "Failed to read accel registers\n";
-        close(fd);
-        return false;
-    }
-
-    close(fd);
-    return true;
-}
-
-bool read_real_accel(double& ax_g,
-                     double& ay_g,
-                     double& az_g)
-{
-    unsigned char data[6];
-
-    /*
-     * BMI270 accelerometer data:
-     * 0x0C = X LSB
-     * 0x0D = X MSB
-     * 0x0E = Y LSB
-     * 0x0F = Y MSB
-     * 0x10 = Z LSB
-     * 0x11 = Z MSB
-     */
-    if (!read_i2c_registers(0x0C, data, 6))
-    {
-        return false;
-    }
-
-    int16_t raw_x = static_cast<int16_t>((data[1] << 8) | data[0]);
-    int16_t raw_y = static_cast<int16_t>((data[3] << 8) | data[2]);
-    int16_t raw_z = static_cast<int16_t>((data[5] << 8) | data[4]);
-
-    /*
-     * Assuming ±2g range.
-     * For a 16-bit signed value:
-     * +2g maps close to +32768
-     * -2g maps close to -32768
-     *
-     * So 1g is about 16384 counts.
-     */
-    ax_g = static_cast<double>(raw_x) / 16384.0;
-    ay_g = static_cast<double>(raw_y) / 16384.0;
-    az_g = static_cast<double>(raw_z) / 16384.0;
-
-    return true;
+    ax = 0.0;
+    ay = 0.0;
+    az = 1.0;
 }
