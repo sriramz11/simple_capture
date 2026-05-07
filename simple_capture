@@ -1,70 +1,75 @@
-bool motion_event = motion_score > MOTION_THRESHOLD;
-bool imu_event = accel_mag > ACCEL_THRESHOLD;
-
-/*
- * Live preview window.
- * We draw on a copy so the saved event frame stays clean.
- */
-cv::Mat preview = frame.clone();
-
-cv::putText(preview,
-            "AI Dashcam Prototype",
-            cv::Point(20, 30),
-            cv::FONT_HERSHEY_SIMPLEX,
-            0.8,
-            cv::Scalar(0, 255, 0),
-            2);
-
-cv::putText(preview,
-            "Motion: " + std::to_string(motion_score),
-            cv::Point(20, 65),
-            cv::FONT_HERSHEY_SIMPLEX,
-            0.7,
-            cv::Scalar(0, 255, 255),
-            2);
-
-cv::putText(preview,
-            "Accel: " + std::to_string(accel_mag) + " g",
-            cv::Point(20, 100),
-            cv::FONT_HERSHEY_SIMPLEX,
-            0.7,
-            cv::Scalar(255, 255, 0),
-            2);
-
-std::string imu_status = imu_ok ? "IMU: BMI270 OK" : "IMU: NOT VERIFIED";
-
-cv::putText(preview,
-            imu_status,
-            cv::Point(20, 135),
-            cv::FONT_HERSHEY_SIMPLEX,
-            0.7,
-            cv::Scalar(255, 255, 255),
-            2);
-
-cv::putText(preview,
-            "Press m = trigger event, q = quit",
-            cv::Point(20, 170),
-            cv::FONT_HERSHEY_SIMPLEX,
-            0.6,
-            cv::Scalar(255, 255, 255),
-            2);
-
-cv::imshow("Dashcam Live Preview", preview);
-
-int key = cv::waitKey(1);
-
-if (key == 'q' || key == 'Q')
+bool read_i2c_registers(unsigned char start_reg,
+                        unsigned char* data,
+                        int length)
 {
-    std::cout << "User quit preview\n";
-    break;
+    int fd = open(I2C_DEVICE, O_RDWR);
+
+    if (fd < 0)
+    {
+        std::cout << "Failed to open I2C device for accel read\n";
+        return false;
+    }
+
+    if (ioctl(fd, I2C_SLAVE, IMU_ADDRESS) < 0)
+    {
+        std::cout << "Failed to select IMU address for accel read\n";
+        close(fd);
+        return false;
+    }
+
+    if (write(fd, &start_reg, 1) != 1)
+    {
+        std::cout << "Failed to write accel start register\n";
+        close(fd);
+        return false;
+    }
+
+    if (read(fd, data, length) != length)
+    {
+        std::cout << "Failed to read accel registers\n";
+        close(fd);
+        return false;
+    }
+
+    close(fd);
+    return true;
 }
 
-bool keyboard_manual_event = (key == 'm' || key == 'M');
-bool manual_event = (manual_trigger && frame_count == 20) || keyboard_manual_event;
+bool read_real_accel(double& ax_g,
+                     double& ay_g,
+                     double& az_g)
+{
+    unsigned char data[6];
 
-std::cout << "frame=" << frame_count
-          << " motion=" << motion_score
-          << " accel=" << accel_mag
-          << "\n";
+    /*
+     * BMI270 accelerometer data:
+     * 0x0C = X LSB
+     * 0x0D = X MSB
+     * 0x0E = Y LSB
+     * 0x0F = Y MSB
+     * 0x10 = Z LSB
+     * 0x11 = Z MSB
+     */
+    if (!read_i2c_registers(0x0C, data, 6))
+    {
+        return false;
+    }
 
-if (motion_event || imu_event || manual_event)
+    int16_t raw_x = static_cast<int16_t>((data[1] << 8) | data[0]);
+    int16_t raw_y = static_cast<int16_t>((data[3] << 8) | data[2]);
+    int16_t raw_z = static_cast<int16_t>((data[5] << 8) | data[4]);
+
+    /*
+     * Assuming ±2g range.
+     * For a 16-bit signed value:
+     * +2g maps close to +32768
+     * -2g maps close to -32768
+     *
+     * So 1g is about 16384 counts.
+     */
+    ax_g = static_cast<double>(raw_x) / 16384.0;
+    ay_g = static_cast<double>(raw_y) / 16384.0;
+    az_g = static_cast<double>(raw_z) / 16384.0;
+
+    return true;
+}
