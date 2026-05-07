@@ -1,505 +1,478 @@
-/*
- * simple_csi_capture.cpp
- *
- * Purpose:
- *   Capture raw frames from a Linux V4L2 camera device and save them
- *   into a folder as frame_000.raw, frame_001.raw, ...
- *
- * Target use:
- *   Radxa ROCK 4D / RK3576 / Radxa OS / MIPI CSI camera
- *
- * API used:
- *   V4L2 = Video4Linux2
- *
- * Important idea:
- *   The CSI camera data is handled by the Linux kernel camera driver.
- *   Userspace sees the final camera stream as /dev/videoX.
- *
- * Capture method:
- *   V4L2 MMAP streaming.
- *
- * Why MMAP?
- *   Camera frames are large.
- *   Instead of copying frame data again and again, the kernel allocates
- *   video buffers, the camera/ISP/DMA writes frames into those buffers,
- *   and userspace maps those buffers using mmap().
- */
+#include <opencv2/opencv.hpp>
 
-#include <fcntl.h>          // open()
-#include <linux/videodev2.h> // V4L2 structs, constants, ioctl request codes
-#include <poll.h>           // poll()
-#include <sys/ioctl.h>      // ioctl()
-#include <sys/mman.h>       // mmap(), munmap()
-#include <unistd.h>         // close()
+#include <linux/i2c-dev.h>
+#include <sys/ioctl.h>
+#include <fcntl.h>
+#include <unistd.h>
 
-#include <cerrno>           // errno
-#include <cstring>          // strerror()
-#include <fstream>          // std::ofstream
-#include <iomanip>          // std::setw, std::setfill
-#include <iostream>         // std::cout, std::cerr
-#include <sstream>          // std::ostringstream
-#include <string>           // std::string
-#include <vector>           // std::vector
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <iomanip>
+#include <chrono>
+#include <ctime>
+#include <deque>
+#include <cmath>
+#include <cstring>
+#include <cerrno>
 
-/*
- * Buffer represents one MMAP buffer.
- *
- * start:
- *   Userspace pointer to the mapped kernel video buffer.
- *
- * length:
- *   Size of that buffer in bytes.
- */
-struct Buffer {
-    void *start = nullptr;
-    size_t length = 0;
+namespace fs = std::filesystem;
+
+static constexpr int BMI270_ADDR = 0x68;
+static constexpr uint8_t BMI270_CHIP_ID_REG = 0x00;
+static constexpr uint8_t BMI270_EXPECTED_CHIP_ID = 0x24;
+
+struct SensorSample
+{
+    std::string timestamp;
+    double ax_g;
+    double ay_g;
+    double az_g;
+    double accel_mag_g;
+    double motion_score;
+    std::string source;
 };
 
-/*
- * xioctl()
- *
- * ioctl() can be interrupted by a signal.
- * If that happens, ioctl() returns -1 and errno becomes EINTR.
- *
- * This helper retries ioctl() automatically if EINTR happens.
- */
-static int xioctl(int fd, unsigned long request, void *arg)
+std::string now_iso_time()
 {
-    int ret;
+    auto now = std::chrono::system_clock::now();
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
 
-    do {
-        ret = ioctl(fd, request, arg);
-    } while (ret == -1 && errno == EINTR);
+    std::tm tm_buf {};
+    localtime_r(&t, &tm_buf);
 
-    return ret;
+    std::ostringstream ss;
+    ss << std::put_time(&tm_buf, "%Y-%m-%dT%H:%M:%S");
+    return ss.str();
 }
 
-/*
- * Convert a 4-character string like "NV12" or "YUYV"
- * into a V4L2 pixel format code.
- *
- * V4L2 uses FOURCC codes for pixel formats.
- *
- * Examples:
- *   "NV12" -> V4L2_PIX_FMT_NV12
- *   "YUYV" -> V4L2_PIX_FMT_YUYV
- *   "MJPG" -> V4L2_PIX_FMT_MJPEG
- */
-static uint32_t fourcc_from_string(const std::string &s)
+std::string hex_byte(uint8_t value)
 {
-    if (s.size() != 4) {
-        return 0;
-    }
-
-    return v4l2_fourcc(s[0], s[1], s[2], s[3]);
+    std::ostringstream ss;
+    ss << "0x"
+       << std::hex
+       << std::setw(2)
+       << std::setfill('0')
+       << static_cast<int>(value);
+    return ss.str();
 }
 
-/*
- * Create output filename.
- *
- * Example:
- *   folder = "./csi_frames"
- *   frame_num = 3
- *
- * Output:
- *   ./csi_frames/frame_003.raw
- */
-static std::string make_filename(const std::string &folder, int frame_num)
+bool read_bmi270_chip_id(const std::string& i2c_dev, uint8_t& chip_id, std::string& error)
 {
-    std::ostringstream oss;
+    int fd = open(i2c_dev.c_str(), O_RDWR);
+    if (fd < 0)
+    {
+        error = "open failed: " + std::string(strerror(errno));
+        return false;
+    }
 
-    oss << folder << "/frame_"
-        << std::setw(3) << std::setfill('0') << frame_num
-        << ".raw";
+    if (ioctl(fd, I2C_SLAVE, BMI270_ADDR) < 0)
+    {
+        error = "ioctl I2C_SLAVE failed: " + std::string(strerror(errno));
+        close(fd);
+        return false;
+    }
 
-    return oss.str();
+    uint8_t reg = BMI270_CHIP_ID_REG;
+
+    if (::write(fd, &reg, 1) != 1)
+    {
+        error = "write chip-id register failed: " + std::string(strerror(errno));
+        close(fd);
+        return false;
+    }
+
+    if (::read(fd, &chip_id, 1) != 1)
+    {
+        error = "read chip-id value failed: " + std::string(strerror(errno));
+        close(fd);
+        return false;
+    }
+
+    close(fd);
+    return true;
 }
 
-int main(int argc, char **argv)
+SensorSample make_simulated_imu_sample(int frame_count, double motion_score)
 {
-    /*
-     * Command line arguments:
-     *
-     * argv[1] = video device path
-     * argv[2] = output folder
-     * argv[3] = width
-     * argv[4] = height
-     * argv[5] = pixel format
-     * argv[6] = number of frames
-     *
-     * Example:
-     *   ./simple_csi_capture /dev/video0 ./csi_frames 640 480 NV12 10
-     */
+    SensorSample s;
+    s.timestamp = now_iso_time();
 
-    std::string device = argc > 1 ? argv[1] : "/dev/video0";
-    std::string folder = argc > 2 ? argv[2] : "./csi_frames";
-    int width = argc > 3 ? std::stoi(argv[3]) : 640;
-    int height = argc > 4 ? std::stoi(argv[4]) : 480;
-    std::string fmt_str = argc > 5 ? argv[5] : "NV12";
-    int frame_count = argc > 6 ? std::stoi(argv[6]) : 10;
+    s.ax_g = 0.02 * std::sin(frame_count * 0.15);
+    s.ay_g = 0.02 * std::cos(frame_count * 0.10);
+    s.az_g = 1.00;
+    s.source = "simulated";
 
     /*
-     * Convert user pixel format string into V4L2 FOURCC format.
+     * Simulate one sudden acceleration event.
+     * This makes testing deterministic during the interview.
      */
-    uint32_t pixfmt = fourcc_from_string(fmt_str);
+    if (frame_count == 80)
+    {
+        s.ax_g = 2.20;
+        s.ay_g = 0.15;
+        s.az_g = 1.10;
+    }
 
-    if (pixfmt == 0 || frame_count <= 0) {
-        std::cerr << "Usage:\n";
-        std::cerr << "  " << argv[0]
-                  << " /dev/videoX output_folder width height FOURCC frame_count\n\n";
-        std::cerr << "Example:\n";
-        std::cerr << "  " << argv[0]
-                  << " /dev/video0 ./csi_frames 640 480 NV12 10\n";
+    s.accel_mag_g = std::sqrt((s.ax_g * s.ax_g) +
+                              (s.ay_g * s.ay_g) +
+                              (s.az_g * s.az_g));
+
+    s.motion_score = motion_score;
+    return s;
+}
+
+double calculate_motion_score(const cv::Mat& frame, cv::Mat& previous_gray)
+{
+    cv::Mat gray;
+    cv::Mat diff;
+    cv::Mat mask;
+
+    cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+    cv::GaussianBlur(gray, gray, cv::Size(5, 5), 0);
+
+    if (previous_gray.empty())
+    {
+        previous_gray = gray.clone();
+        return 0.0;
+    }
+
+    cv::absdiff(previous_gray, gray, diff);
+    cv::threshold(diff, mask, 25, 255, cv::THRESH_BINARY);
+
+    double changed_pixels = static_cast<double>(cv::countNonZero(mask));
+    double total_pixels = static_cast<double>(mask.total());
+
+    previous_gray = gray.clone();
+
+    if (total_pixels <= 0.0)
+    {
+        return 0.0;
+    }
+
+    return changed_pixels / total_pixels;
+}
+
+std::string event_dir_name(int event_id)
+{
+    std::ostringstream ss;
+    ss << "event_"
+       << std::setw(3)
+       << std::setfill('0')
+       << event_id;
+
+    return ss.str();
+}
+
+int next_event_id(const fs::path& root)
+{
+    fs::create_directories(root);
+
+    int id = 1;
+    while (fs::exists(root / event_dir_name(id)))
+    {
+        id++;
+    }
+
+    return id;
+}
+
+void write_sensor_csv(const fs::path& path, const std::deque<SensorSample>& samples)
+{
+    std::ofstream csv(path);
+
+    csv << "timestamp,ax_g,ay_g,az_g,accel_mag_g,motion_score,source\n";
+
+    for (const auto& s : samples)
+    {
+        csv << s.timestamp << ","
+            << s.ax_g << ","
+            << s.ay_g << ","
+            << s.az_g << ","
+            << s.accel_mag_g << ","
+            << s.motion_score << ","
+            << s.source << "\n";
+    }
+}
+
+void write_event_json(const fs::path& path,
+                      const std::string& trigger,
+                      double confidence,
+                      const std::string& camera_dev,
+                      const std::string& i2c_dev,
+                      uint8_t chip_id,
+                      bool chip_ok)
+{
+    std::ofstream json(path);
+
+    json << "{\n";
+    json << "  \"timestamp\": \"" << now_iso_time() << "\",\n";
+    json << "  \"trigger\": \"" << trigger << "\",\n";
+    json << "  \"confidence\": " << confidence << ",\n";
+    json << "  \"camera\": {\n";
+    json << "    \"device\": \"" << camera_dev << "\",\n";
+    json << "    \"file\": \"frame.jpg\"\n";
+    json << "  },\n";
+    json << "  \"imu\": {\n";
+    json << "    \"bus\": \"" << i2c_dev << "\",\n";
+    json << "    \"address\": \"0x68\",\n";
+    json << "    \"chip_id\": \"" << (chip_ok ? hex_byte(chip_id) : "unavailable") << "\",\n";
+    json << "    \"accel_source\": \"simulated\"\n";
+    json << "  },\n";
+    json << "  \"files\": [\"frame.jpg\", \"sensor.csv\", \"debug.log\"]\n";
+    json << "}\n";
+}
+
+void write_debug_log(const fs::path& path,
+                     const std::string& trigger,
+                     double motion_score,
+                     double accel_mag,
+                     bool chip_ok,
+                     uint8_t chip_id,
+                     const std::string& chip_error)
+{
+    std::ofstream log(path);
+
+    log << "event_time=" << now_iso_time() << "\n";
+    log << "trigger=" << trigger << "\n";
+    log << "motion_score=" << motion_score << "\n";
+    log << "accel_mag_g=" << accel_mag << "\n";
+
+    if (chip_ok)
+    {
+        log << "bmi270_chip_id=" << hex_byte(chip_id) << "\n";
+        log << "bmi270_expected_chip_id=" << hex_byte(BMI270_EXPECTED_CHIP_ID) << "\n";
+        log << "imu_status=present\n";
+    }
+    else
+    {
+        log << "imu_status=failed\n";
+        log << "imu_error=" << chip_error << "\n";
+    }
+
+    log << "camera_source=/dev/video0\n";
+    log << "accel_source=simulated_after_chip_id_verification\n";
+    log << "motion_trigger_threshold=0.020\n";
+    log << "imu_trigger_threshold_g=1.700\n";
+}
+
+void save_event_package(const fs::path& root,
+                        const cv::Mat& frame,
+                        const std::deque<cv::Mat>& pre_frames,
+                        const std::deque<SensorSample>& sensor_ring,
+                        const std::string& trigger,
+                        double confidence,
+                        const std::string& camera_dev,
+                        const std::string& i2c_dev,
+                        uint8_t chip_id,
+                        bool chip_ok,
+                        const std::string& chip_error,
+                        double motion_score,
+                        double accel_mag)
+{
+    int id = next_event_id(root);
+    fs::path event_dir = root / event_dir_name(id);
+
+    fs::create_directories(event_dir);
+    fs::create_directories(event_dir / "pre_event_frames");
+
+    cv::imwrite((event_dir / "frame.jpg").string(), frame);
+
+    int index = 0;
+    for (const auto& f : pre_frames)
+    {
+        std::ostringstream filename;
+        filename << "pre_" << std::setw(2) << std::setfill('0') << index << ".jpg";
+        cv::imwrite((event_dir / "pre_event_frames" / filename.str()).string(), f);
+        index++;
+    }
+
+    write_sensor_csv(event_dir / "sensor.csv", sensor_ring);
+
+    write_event_json(event_dir / "event.json",
+                     trigger,
+                     confidence,
+                     camera_dev,
+                     i2c_dev,
+                     chip_id,
+                     chip_ok);
+
+    write_debug_log(event_dir / "debug.log",
+                    trigger,
+                    motion_score,
+                    accel_mag,
+                    chip_ok,
+                    chip_id,
+                    chip_error);
+
+    std::cout << "Event saved: " << event_dir << "\n";
+}
+
+int main(int argc, char* argv[])
+{
+    std::string camera_dev = "/dev/video0";
+    std::string i2c_dev = "/dev/i2c-8";
+    std::string output_root = "./events";
+
+    bool manual_trigger = false;
+    int max_frames = 300;
+
+    for (int i = 1; i < argc; i++)
+    {
+        std::string arg = argv[i];
+
+        if (arg == "--manual")
+        {
+            manual_trigger = true;
+        }
+        else if (arg == "--out" && i + 1 < argc)
+        {
+            output_root = argv[++i];
+        }
+        else if (arg == "--frames" && i + 1 < argc)
+        {
+            max_frames = std::stoi(argv[++i]);
+        }
+    }
+
+    std::cout << "Dashcam prototype starting\n";
+    std::cout << "Camera: " << camera_dev << "\n";
+    std::cout << "IMU: " << i2c_dev << " addr 0x68\n";
+    std::cout << "Output root: " << output_root << "\n";
+
+    uint8_t chip_id = 0;
+    std::string chip_error;
+    bool chip_ok = read_bmi270_chip_id(i2c_dev, chip_id, chip_error);
+
+    if (chip_ok)
+    {
+        std::cout << "BMI270 chip ID read: " << hex_byte(chip_id) << "\n";
+
+        if (chip_id != BMI270_EXPECTED_CHIP_ID)
+        {
+            std::cout << "Warning: expected BMI270 chip ID 0x24\n";
+        }
+    }
+    else
+    {
+        std::cout << "Warning: could not read BMI270 chip ID: "
+                  << chip_error << "\n";
+    }
+
+    cv::VideoCapture cap;
+
+    if (!cap.open(camera_dev, cv::CAP_V4L2))
+    {
+        std::cerr << "Failed to open camera at " << camera_dev << "\n";
         return 1;
     }
 
-    /*
-     * STEP 1:
-     * Open the V4L2 camera device.
-     *
-     * /dev/video0, /dev/video1, etc. are device files exposed by Linux.
-     * For a CSI camera, the kernel driver handles the hardware side.
-     */
-    int fd = open(device.c_str(), O_RDWR);
+    cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
+    cap.set(cv::CAP_PROP_FRAME_WIDTH, 640);
+    cap.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
+    cap.set(cv::CAP_PROP_FPS, 30);
 
-    if (fd < 0) {
-        std::cerr << "open(" << device << ") failed: "
-                  << strerror(errno) << "\n";
+    if (!cap.isOpened())
+    {
+        std::cerr << "Camera is not opened\n";
         return 1;
     }
 
-    /*
-     * STEP 2:
-     * Query camera capability.
-     *
-     * This asks:
-     *   What driver owns this node?
-     *   Is this a capture device?
-     *   Does it support streaming?
-     */
-    v4l2_capability cap {};
+    cv::Mat previous_gray;
+    std::deque<cv::Mat> pre_event_frames;
+    std::deque<SensorSample> sensor_ring;
 
-    if (xioctl(fd, VIDIOC_QUERYCAP, &cap) < 0) {
-        std::cerr << "VIDIOC_QUERYCAP failed: "
-                  << strerror(errno) << "\n";
-        close(fd);
-        return 1;
-    }
+    constexpr size_t PRE_EVENT_FRAME_COUNT = 10;
+    constexpr size_t SENSOR_RING_COUNT = 50;
 
-    std::cout << "Driver: " << cap.driver << "\n";
-    std::cout << "Card:   " << cap.card << "\n";
-    std::cout << "Bus:    " << cap.bus_info << "\n";
+    constexpr double MOTION_THRESHOLD = 0.020;
+    constexpr double IMU_ACCEL_THRESHOLD_G = 1.700;
 
-    /*
-     * Some drivers report capability in cap.capabilities.
-     * Some report device-specific capability in cap.device_caps.
-     */
-    uint32_t caps = cap.device_caps ? cap.device_caps : cap.capabilities;
+    for (int frame_count = 0; frame_count < max_frames; frame_count++)
+    {
+        cv::Mat frame;
+        cap >> frame;
 
-    /*
-     * This simple program supports single-planar capture:
-     *   V4L2_BUF_TYPE_VIDEO_CAPTURE
-     *
-     * Some Rockchip camera nodes may use multi-planar capture:
-     *   V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE
-     *
-     * For simple interview/demo code, try another /dev/videoX node first
-     * if this one is not single-planar.
-     */
-    if (!(caps & V4L2_CAP_VIDEO_CAPTURE)) {
-        std::cerr << "This node is not a single-planar V4L2 capture device.\n";
-        std::cerr << "Try another /dev/videoX node from:\n";
-        std::cerr << "  v4l2-ctl --list-devices\n";
-        std::cerr << "  grep -H '' /sys/class/video4linux/video*/name\n";
-        close(fd);
-        return 1;
-    }
-
-    if (!(caps & V4L2_CAP_STREAMING)) {
-        std::cerr << "This device does not support V4L2 streaming I/O.\n";
-        close(fd);
-        return 1;
-    }
-
-    /*
-     * STEP 3:
-     * Set camera format.
-     *
-     * We request:
-     *   width
-     *   height
-     *   pixel format such as NV12 or YUYV
-     *
-     * The driver may adjust the actual format.
-     * That is why we print the returned values after VIDIOC_S_FMT.
-     */
-    v4l2_format fmt {};
-
-    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    fmt.fmt.pix.width = width;
-    fmt.fmt.pix.height = height;
-    fmt.fmt.pix.pixelformat = pixfmt;
-    fmt.fmt.pix.field = V4L2_FIELD_NONE;
-
-    if (xioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
-        std::cerr << "VIDIOC_S_FMT failed for "
-                  << width << "x" << height << " " << fmt_str
-                  << ": " << strerror(errno) << "\n";
-
-        std::cerr << "Check supported formats using:\n";
-        std::cerr << "  v4l2-ctl -d " << device << " --list-formats-ext\n";
-
-        close(fd);
-        return 1;
-    }
-
-    std::cout << "Requested format: "
-              << width << "x" << height << " " << fmt_str << "\n";
-
-    std::cout << "Driver selected:  "
-              << fmt.fmt.pix.width << "x"
-              << fmt.fmt.pix.height
-              << " sizeimage=" << fmt.fmt.pix.sizeimage
-              << "\n";
-
-    /*
-     * STEP 4:
-     * Request MMAP buffers from the driver.
-     *
-     * req.count = 4 means we ask for 4 video buffers.
-     *
-     * Why multiple buffers?
-     *   While userspace is processing one frame, the camera can fill another.
-     *   This reduces frame drops.
-     */
-    v4l2_requestbuffers req {};
-
-    req.count = 4;
-    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    req.memory = V4L2_MEMORY_MMAP;
-
-    if (xioctl(fd, VIDIOC_REQBUFS, &req) < 0) {
-        std::cerr << "VIDIOC_REQBUFS failed: "
-                  << strerror(errno) << "\n";
-        close(fd);
-        return 1;
-    }
-
-    if (req.count < 2) {
-        std::cerr << "Driver returned too few buffers: "
-                  << req.count << "\n";
-        close(fd);
-        return 1;
-    }
-
-    std::cout << "Driver allocated " << req.count << " buffers\n";
-
-    /*
-     * Store all buffer mappings in this vector.
-     */
-    std::vector<Buffer> buffers(req.count);
-
-    /*
-     * STEP 5:
-     * Query each buffer and mmap it into userspace.
-     *
-     * VIDIOC_QUERYBUF tells us:
-     *   buffer size
-     *   offset used for mmap()
-     *
-     * mmap() maps kernel video buffer memory into this process.
-     */
-    for (unsigned int i = 0; i < req.count; i++) {
-        v4l2_buffer buf {};
-
-        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        buf.memory = V4L2_MEMORY_MMAP;
-        buf.index = i;
-
-        if (xioctl(fd, VIDIOC_QUERYBUF, &buf) < 0) {
-            std::cerr << "VIDIOC_QUERYBUF failed for buffer "
-                      << i << ": " << strerror(errno) << "\n";
-            close(fd);
-            return 1;
+        if (frame.empty())
+        {
+            std::cerr << "Empty frame received\n";
+            continue;
         }
 
-        buffers[i].length = buf.length;
+        double motion_score = calculate_motion_score(frame, previous_gray);
+        SensorSample sample = make_simulated_imu_sample(frame_count, motion_score);
 
-        buffers[i].start = mmap(nullptr,
-                                buf.length,
-                                PROT_READ | PROT_WRITE,
-                                MAP_SHARED,
-                                fd,
-                                buf.m.offset);
-
-        if (buffers[i].start == MAP_FAILED) {
-            std::cerr << "mmap failed for buffer "
-                      << i << ": " << strerror(errno) << "\n";
-            close(fd);
-            return 1;
+        sensor_ring.push_back(sample);
+        if (sensor_ring.size() > SENSOR_RING_COUNT)
+        {
+            sensor_ring.pop_front();
         }
 
-        /*
-         * STEP 6:
-         * Queue the empty buffer to the driver.
-         *
-         * After QBUF, the driver owns this buffer and can fill it
-         * with camera frame data.
-         */
-        if (xioctl(fd, VIDIOC_QBUF, &buf) < 0) {
-            std::cerr << "VIDIOC_QBUF failed for buffer "
-                      << i << ": " << strerror(errno) << "\n";
-            close(fd);
-            return 1;
-        }
-    }
-
-    /*
-     * STEP 7:
-     * Start streaming.
-     *
-     * After STREAMON, the camera pipeline starts producing frames.
-     * Hardware/driver will fill the queued buffers.
-     */
-    v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-
-    if (xioctl(fd, VIDIOC_STREAMON, &type) < 0) {
-        std::cerr << "VIDIOC_STREAMON failed: "
-                  << strerror(errno) << "\n";
-        close(fd);
-        return 1;
-    }
-
-    std::cout << "Streaming started\n";
-
-    /*
-     * STEP 8:
-     * Capture frames.
-     *
-     * Loop:
-     *   poll() waits until a frame is ready.
-     *   VIDIOC_DQBUF gets one filled buffer from the driver.
-     *   Write the frame data to a file.
-     *   VIDIOC_QBUF gives the buffer back to the driver.
-     */
-    for (int frame = 0; frame < frame_count; frame++) {
-        /*
-         * poll() waits for frame readiness.
-         *
-         * Timeout = 2000 ms.
-         *
-         * This prevents the program from hanging forever if the camera
-         * stops producing frames.
-         */
-        pollfd pfd {};
-
-        pfd.fd = fd;
-        pfd.events = POLLIN;
-
-        int pret = poll(&pfd, 1, 2000);
-
-        if (pret < 0) {
-            std::cerr << "poll failed: "
-                      << strerror(errno) << "\n";
-            break;
+        pre_event_frames.push_back(frame.clone());
+        if (pre_event_frames.size() > PRE_EVENT_FRAME_COUNT)
+        {
+            pre_event_frames.pop_front();
         }
 
-        if (pret == 0) {
-            std::cerr << "poll timeout: no frame received\n";
-            break;
-        }
+        bool motion_event = motion_score > MOTION_THRESHOLD;
+        bool imu_event = sample.accel_mag_g > IMU_ACCEL_THRESHOLD_G;
+        bool manual_event = manual_trigger && frame_count == 20;
 
-        /*
-         * Dequeue a filled buffer.
-         *
-         * After DQBUF, userspace owns the buffer temporarily.
-         */
-        v4l2_buffer buf {};
+        bool triggered = motion_event || imu_event || manual_event;
 
-        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        buf.memory = V4L2_MEMORY_MMAP;
-
-        if (xioctl(fd, VIDIOC_DQBUF, &buf) < 0) {
-            std::cerr << "VIDIOC_DQBUF failed: "
-                      << strerror(errno) << "\n";
-            break;
-        }
-
-        /*
-         * Create frame filename.
-         */
-        std::string filename = make_filename(folder, frame);
-
-        /*
-         * Save raw frame data.
-         *
-         * buf.bytesused tells how many valid bytes are in this buffer.
-         */
-        std::ofstream out(filename, std::ios::binary);
-
-        if (!out) {
-            std::cerr << "Could not open output file: "
-                      << filename << "\n";
-
-            /*
-             * Requeue buffer before breaking.
-             * Otherwise driver loses one available buffer.
-             */
-            xioctl(fd, VIDIOC_QBUF, &buf);
-            break;
-        }
-
-        out.write(static_cast<char *>(buffers[buf.index].start),
-                  static_cast<std::streamsize>(buf.bytesused));
-
-        out.close();
-
-        std::cout << "Saved " << filename
-                  << " bytes=" << buf.bytesused
-                  << " buffer_index=" << buf.index
+        std::cout << "frame=" << frame_count
+                  << " motion=" << motion_score
+                  << " accel_mag_g=" << sample.accel_mag_g
                   << "\n";
 
-        /*
-         * Requeue the buffer.
-         *
-         * After QBUF, the driver owns it again and can fill it with
-         * another frame.
-         */
-        if (xioctl(fd, VIDIOC_QBUF, &buf) < 0) {
-            std::cerr << "VIDIOC_QBUF requeue failed: "
-                      << strerror(errno) << "\n";
-            break;
+        if (triggered)
+        {
+            std::string trigger_name;
+            double confidence = 0.80;
+
+            if (motion_event && imu_event)
+            {
+                trigger_name = "motion_and_imu_detected";
+                confidence = 0.95;
+            }
+            else if (motion_event)
+            {
+                trigger_name = "motion_detected";
+                confidence = std::min(0.99, 0.50 + motion_score * 10.0);
+            }
+            else if (imu_event)
+            {
+                trigger_name = "simulated_sudden_acceleration";
+                confidence = 0.85;
+            }
+            else
+            {
+                trigger_name = "manual_test_trigger";
+                confidence = 1.00;
+            }
+
+            save_event_package(fs::path(output_root),
+                               frame,
+                               pre_event_frames,
+                               sensor_ring,
+                               trigger_name,
+                               confidence,
+                               camera_dev,
+                               i2c_dev,
+                               chip_id,
+                               chip_ok,
+                               chip_error,
+                               motion_score,
+                               sample.accel_mag_g);
+
+            std::cout << "Prototype complete. One event package generated.\n";
+            return 0;
         }
     }
 
-    /*
-     * STEP 9:
-     * Stop streaming.
-     */
-    if (xioctl(fd, VIDIOC_STREAMOFF, &type) < 0) {
-        std::cerr << "VIDIOC_STREAMOFF failed: "
-                  << strerror(errno) << "\n";
-    } else {
-        std::cout << "Streaming stopped\n";
-    }
-
-    /*
-     * STEP 10:
-     * Unmap all MMAP buffers.
-     */
-    for (auto &b : buffers) {
-        if (b.start && b.start != MAP_FAILED) {
-            munmap(b.start, b.length);
-        }
-    }
-
-    /*
-     * STEP 11:
-     * Close the camera device.
-     */
-    close(fd);
-
-    std::cout << "Done\n";
+    std::cout << "No event triggered before frame limit.\n";
+    std::cout << "Try running with --manual for deterministic testing.\n";
 
     return 0;
 }
