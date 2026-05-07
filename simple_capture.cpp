@@ -5,36 +5,25 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#include <filesystem>
-#include <fstream>
 #include <iostream>
-#include <sstream>
-#include <iomanip>
+#include <fstream>
+#include <filesystem>
 #include <chrono>
 #include <ctime>
-#include <deque>
+#include <iomanip>
+#include <sstream>
 #include <cmath>
 #include <cstring>
-#include <cerrno>
 
 namespace fs = std::filesystem;
 
-static constexpr int BMI270_ADDR = 0x68;
-static constexpr uint8_t BMI270_CHIP_ID_REG = 0x00;
-static constexpr uint8_t BMI270_EXPECTED_CHIP_ID = 0x24;
+#define CAMERA_DEVICE "/dev/video0"
+#define I2C_DEVICE    "/dev/i2c-8"
+#define IMU_ADDRESS   0x68
+#define CHIP_ID_REG   0x00
+#define EXPECTED_ID   0x24
 
-struct SensorSample
-{
-    std::string timestamp;
-    double ax_g;
-    double ay_g;
-    double az_g;
-    double accel_mag_g;
-    double motion_score;
-    std::string source;
-};
-
-std::string now_iso_time()
+std::string get_time()
 {
     auto now = std::chrono::system_clock::now();
     std::time_t t = std::chrono::system_clock::to_time_t(now);
@@ -47,45 +36,35 @@ std::string now_iso_time()
     return ss.str();
 }
 
-std::string hex_byte(uint8_t value)
+bool read_imu_chip_id(unsigned char& chip_id)
 {
-    std::ostringstream ss;
-    ss << "0x"
-       << std::hex
-       << std::setw(2)
-       << std::setfill('0')
-       << static_cast<int>(value);
-    return ss.str();
-}
+    int fd = open(I2C_DEVICE, O_RDWR);
 
-bool read_bmi270_chip_id(const std::string& i2c_dev, uint8_t& chip_id, std::string& error)
-{
-    int fd = open(i2c_dev.c_str(), O_RDWR);
     if (fd < 0)
     {
-        error = "open failed: " + std::string(strerror(errno));
+        std::cout << "Failed to open I2C device\n";
         return false;
     }
 
-    if (ioctl(fd, I2C_SLAVE, BMI270_ADDR) < 0)
+    if (ioctl(fd, I2C_SLAVE, IMU_ADDRESS) < 0)
     {
-        error = "ioctl I2C_SLAVE failed: " + std::string(strerror(errno));
+        std::cout << "Failed to select IMU address\n";
         close(fd);
         return false;
     }
 
-    uint8_t reg = BMI270_CHIP_ID_REG;
+    unsigned char reg = CHIP_ID_REG;
 
-    if (::write(fd, &reg, 1) != 1)
+    if (write(fd, &reg, 1) != 1)
     {
-        error = "write chip-id register failed: " + std::string(strerror(errno));
+        std::cout << "Failed to write chip ID register\n";
         close(fd);
         return false;
     }
 
-    if (::read(fd, &chip_id, 1) != 1)
+    if (read(fd, &chip_id, 1) != 1)
     {
-        error = "read chip-id value failed: " + std::string(strerror(errno));
+        std::cout << "Failed to read chip ID\n";
         close(fd);
         return false;
     }
@@ -94,36 +73,7 @@ bool read_bmi270_chip_id(const std::string& i2c_dev, uint8_t& chip_id, std::stri
     return true;
 }
 
-SensorSample make_simulated_imu_sample(int frame_count, double motion_score)
-{
-    SensorSample s;
-    s.timestamp = now_iso_time();
-
-    s.ax_g = 0.02 * std::sin(frame_count * 0.15);
-    s.ay_g = 0.02 * std::cos(frame_count * 0.10);
-    s.az_g = 1.00;
-    s.source = "simulated";
-
-    /*
-     * Simulate one sudden acceleration event.
-     * This makes testing deterministic during the interview.
-     */
-    if (frame_count == 80)
-    {
-        s.ax_g = 2.20;
-        s.ay_g = 0.15;
-        s.az_g = 1.10;
-    }
-
-    s.accel_mag_g = std::sqrt((s.ax_g * s.ax_g) +
-                              (s.ay_g * s.ay_g) +
-                              (s.az_g * s.az_g));
-
-    s.motion_score = motion_score;
-    return s;
-}
-
-double calculate_motion_score(const cv::Mat& frame, cv::Mat& previous_gray)
+double calculate_motion(cv::Mat& frame, cv::Mat& previous_gray)
 {
     cv::Mat gray;
     cv::Mat diff;
@@ -141,338 +91,191 @@ double calculate_motion_score(const cv::Mat& frame, cv::Mat& previous_gray)
     cv::absdiff(previous_gray, gray, diff);
     cv::threshold(diff, mask, 25, 255, cv::THRESH_BINARY);
 
-    double changed_pixels = static_cast<double>(cv::countNonZero(mask));
-    double total_pixels = static_cast<double>(mask.total());
+    double changed_pixels = cv::countNonZero(mask);
+    double total_pixels = mask.total();
 
     previous_gray = gray.clone();
-
-    if (total_pixels <= 0.0)
-    {
-        return 0.0;
-    }
 
     return changed_pixels / total_pixels;
 }
 
-std::string event_dir_name(int event_id)
+void write_event_files(cv::Mat& frame,
+                       double motion_score,
+                       double accel_mag,
+                       unsigned char chip_id,
+                       bool imu_ok,
+                       std::string trigger)
 {
-    std::ostringstream ss;
-    ss << "event_"
-       << std::setw(3)
-       << std::setfill('0')
-       << event_id;
+    fs::create_directories("events/event_001");
 
-    return ss.str();
-}
+    cv::imwrite("events/event_001/frame.jpg", frame);
 
-int next_event_id(const fs::path& root)
-{
-    fs::create_directories(root);
+    std::ofstream csv("events/event_001/sensor.csv");
+    csv << "timestamp,motion_score,accel_mag_g,imu_source\n";
+    csv << get_time() << ","
+        << motion_score << ","
+        << accel_mag << ","
+        << "simulated_after_chip_id_check\n";
+    csv.close();
 
-    int id = 1;
-    while (fs::exists(root / event_dir_name(id)))
-    {
-        id++;
-    }
-
-    return id;
-}
-
-void write_sensor_csv(const fs::path& path, const std::deque<SensorSample>& samples)
-{
-    std::ofstream csv(path);
-
-    csv << "timestamp,ax_g,ay_g,az_g,accel_mag_g,motion_score,source\n";
-
-    for (const auto& s : samples)
-    {
-        csv << s.timestamp << ","
-            << s.ax_g << ","
-            << s.ay_g << ","
-            << s.az_g << ","
-            << s.accel_mag_g << ","
-            << s.motion_score << ","
-            << s.source << "\n";
-    }
-}
-
-void write_event_json(const fs::path& path,
-                      const std::string& trigger,
-                      double confidence,
-                      const std::string& camera_dev,
-                      const std::string& i2c_dev,
-                      uint8_t chip_id,
-                      bool chip_ok)
-{
-    std::ofstream json(path);
-
+    std::ofstream json("events/event_001/event.json");
     json << "{\n";
-    json << "  \"timestamp\": \"" << now_iso_time() << "\",\n";
+    json << "  \"timestamp\": \"" << get_time() << "\",\n";
     json << "  \"trigger\": \"" << trigger << "\",\n";
-    json << "  \"confidence\": " << confidence << ",\n";
+    json << "  \"confidence\": 0.85,\n";
+
     json << "  \"camera\": {\n";
-    json << "    \"device\": \"" << camera_dev << "\",\n";
+    json << "    \"device\": \"/dev/video0\",\n";
     json << "    \"file\": \"frame.jpg\"\n";
     json << "  },\n";
+
     json << "  \"imu\": {\n";
-    json << "    \"bus\": \"" << i2c_dev << "\",\n";
+    json << "    \"bus\": \"/dev/i2c-8\",\n";
     json << "    \"address\": \"0x68\",\n";
-    json << "    \"chip_id\": \"" << (chip_ok ? hex_byte(chip_id) : "unavailable") << "\",\n";
-    json << "    \"accel_source\": \"simulated\"\n";
-    json << "  },\n";
-    json << "  \"files\": [\"frame.jpg\", \"sensor.csv\", \"debug.log\"]\n";
-    json << "}\n";
-}
 
-void write_debug_log(const fs::path& path,
-                     const std::string& trigger,
-                     double motion_score,
-                     double accel_mag,
-                     bool chip_ok,
-                     uint8_t chip_id,
-                     const std::string& chip_error)
-{
-    std::ofstream log(path);
-
-    log << "event_time=" << now_iso_time() << "\n";
-    log << "trigger=" << trigger << "\n";
-    log << "motion_score=" << motion_score << "\n";
-    log << "accel_mag_g=" << accel_mag << "\n";
-
-    if (chip_ok)
+    if (imu_ok)
     {
-        log << "bmi270_chip_id=" << hex_byte(chip_id) << "\n";
-        log << "bmi270_expected_chip_id=" << hex_byte(BMI270_EXPECTED_CHIP_ID) << "\n";
-        log << "imu_status=present\n";
+        json << "    \"chip_id\": \"0x"
+             << std::hex
+             << static_cast<int>(chip_id)
+             << "\",\n";
     }
     else
     {
-        log << "imu_status=failed\n";
-        log << "imu_error=" << chip_error << "\n";
+        json << "    \"chip_id\": \"unavailable\",\n";
     }
 
-    log << "camera_source=/dev/video0\n";
-    log << "accel_source=simulated_after_chip_id_verification\n";
-    log << "motion_trigger_threshold=0.020\n";
-    log << "imu_trigger_threshold_g=1.700\n";
-}
+    json << "    \"accel_source\": \"simulated\"\n";
+    json << "  },\n";
 
-void save_event_package(const fs::path& root,
-                        const cv::Mat& frame,
-                        const std::deque<cv::Mat>& pre_frames,
-                        const std::deque<SensorSample>& sensor_ring,
-                        const std::string& trigger,
-                        double confidence,
-                        const std::string& camera_dev,
-                        const std::string& i2c_dev,
-                        uint8_t chip_id,
-                        bool chip_ok,
-                        const std::string& chip_error,
-                        double motion_score,
-                        double accel_mag)
-{
-    int id = next_event_id(root);
-    fs::path event_dir = root / event_dir_name(id);
+    json << "  \"files\": [\"frame.jpg\", \"sensor.csv\"]\n";
+    json << "}\n";
+    json.close();
 
-    fs::create_directories(event_dir);
-    fs::create_directories(event_dir / "pre_event_frames");
-
-    cv::imwrite((event_dir / "frame.jpg").string(), frame);
-
-    int index = 0;
-    for (const auto& f : pre_frames)
-    {
-        std::ostringstream filename;
-        filename << "pre_" << std::setw(2) << std::setfill('0') << index << ".jpg";
-        cv::imwrite((event_dir / "pre_event_frames" / filename.str()).string(), f);
-        index++;
-    }
-
-    write_sensor_csv(event_dir / "sensor.csv", sensor_ring);
-
-    write_event_json(event_dir / "event.json",
-                     trigger,
-                     confidence,
-                     camera_dev,
-                     i2c_dev,
-                     chip_id,
-                     chip_ok);
-
-    write_debug_log(event_dir / "debug.log",
-                    trigger,
-                    motion_score,
-                    accel_mag,
-                    chip_ok,
-                    chip_id,
-                    chip_error);
-
-    std::cout << "Event saved: " << event_dir << "\n";
+    std::ofstream log("events/event_001/debug.log");
+    log << "Event created at " << get_time() << "\n";
+    log << "Trigger: " << trigger << "\n";
+    log << "Motion score: " << motion_score << "\n";
+    log << "Acceleration magnitude: " << accel_mag << "\n";
+    log << "IMU verified: " << (imu_ok ? "yes" : "no") << "\n";
+    log.close();
 }
 
 int main(int argc, char* argv[])
 {
-    std::string camera_dev = "/dev/video0";
-    std::string i2c_dev = "/dev/i2c-8";
-    std::string output_root = "./events";
-
     bool manual_trigger = false;
-    int max_frames = 300;
 
-    for (int i = 1; i < argc; i++)
+    if (argc > 1)
     {
-        std::string arg = argv[i];
+        std::string arg = argv[1];
 
         if (arg == "--manual")
         {
             manual_trigger = true;
         }
-        else if (arg == "--out" && i + 1 < argc)
-        {
-            output_root = argv[++i];
-        }
-        else if (arg == "--frames" && i + 1 < argc)
-        {
-            max_frames = std::stoi(argv[++i]);
-        }
     }
 
-    std::cout << "Dashcam prototype starting\n";
-    std::cout << "Camera: " << camera_dev << "\n";
-    std::cout << "IMU: " << i2c_dev << " addr 0x68\n";
-    std::cout << "Output root: " << output_root << "\n";
+    std::cout << "Starting simple dashcam prototype\n";
 
-    uint8_t chip_id = 0;
-    std::string chip_error;
-    bool chip_ok = read_bmi270_chip_id(i2c_dev, chip_id, chip_error);
+    unsigned char chip_id = 0;
+    bool imu_ok = read_imu_chip_id(chip_id);
 
-    if (chip_ok)
+    if (imu_ok && chip_id == EXPECTED_ID)
     {
-        std::cout << "BMI270 chip ID read: " << hex_byte(chip_id) << "\n";
-
-        if (chip_id != BMI270_EXPECTED_CHIP_ID)
-        {
-            std::cout << "Warning: expected BMI270 chip ID 0x24\n";
-        }
+        std::cout << "BMI270 verified. Chip ID = 0x24\n";
     }
     else
     {
-        std::cout << "Warning: could not read BMI270 chip ID: "
-                  << chip_error << "\n";
+        std::cout << "IMU chip ID check failed or unexpected\n";
     }
 
-    cv::VideoCapture cap;
+    cv::VideoCapture camera(CAMERA_DEVICE, cv::CAP_V4L2);
 
-    if (!cap.open(camera_dev, cv::CAP_V4L2))
+    if (!camera.isOpened())
     {
-        std::cerr << "Failed to open camera at " << camera_dev << "\n";
+        std::cout << "Failed to open camera\n";
         return 1;
     }
 
-    cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
-    cap.set(cv::CAP_PROP_FRAME_WIDTH, 640);
-    cap.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
-    cap.set(cv::CAP_PROP_FPS, 30);
+    camera.set(cv::CAP_PROP_FRAME_WIDTH, 640);
+    camera.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
+    camera.set(cv::CAP_PROP_FPS, 30);
 
-    if (!cap.isOpened())
-    {
-        std::cerr << "Camera is not opened\n";
-        return 1;
-    }
-
+    cv::Mat frame;
     cv::Mat previous_gray;
-    std::deque<cv::Mat> pre_event_frames;
-    std::deque<SensorSample> sensor_ring;
 
-    constexpr size_t PRE_EVENT_FRAME_COUNT = 10;
-    constexpr size_t SENSOR_RING_COUNT = 50;
+    const double MOTION_THRESHOLD = 0.02;
+    const double ACCEL_THRESHOLD = 1.70;
 
-    constexpr double MOTION_THRESHOLD = 0.020;
-    constexpr double IMU_ACCEL_THRESHOLD_G = 1.700;
-
-    for (int frame_count = 0; frame_count < max_frames; frame_count++)
+    for (int frame_count = 0; frame_count < 200; frame_count++)
     {
-        cv::Mat frame;
-        cap >> frame;
+        camera >> frame;
 
         if (frame.empty())
         {
-            std::cerr << "Empty frame received\n";
+            std::cout << "Empty camera frame\n";
             continue;
         }
 
-        double motion_score = calculate_motion_score(frame, previous_gray);
-        SensorSample sample = make_simulated_imu_sample(frame_count, motion_score);
+        double motion_score = calculate_motion(frame, previous_gray);
 
-        sensor_ring.push_back(sample);
-        if (sensor_ring.size() > SENSOR_RING_COUNT)
+        double ax = 0.02;
+        double ay = 0.01;
+        double az = 1.00;
+
+        if (frame_count == 80)
         {
-            sensor_ring.pop_front();
+            ax = 2.20;
+            ay = 0.10;
+            az = 1.00;
         }
 
-        pre_event_frames.push_back(frame.clone());
-        if (pre_event_frames.size() > PRE_EVENT_FRAME_COUNT)
-        {
-            pre_event_frames.pop_front();
-        }
+        double accel_mag = std::sqrt((ax * ax) + (ay * ay) + (az * az));
 
         bool motion_event = motion_score > MOTION_THRESHOLD;
-        bool imu_event = sample.accel_mag_g > IMU_ACCEL_THRESHOLD_G;
+        bool imu_event = accel_mag > ACCEL_THRESHOLD;
         bool manual_event = manual_trigger && frame_count == 20;
-
-        bool triggered = motion_event || imu_event || manual_event;
 
         std::cout << "frame=" << frame_count
                   << " motion=" << motion_score
-                  << " accel_mag_g=" << sample.accel_mag_g
+                  << " accel=" << accel_mag
                   << "\n";
 
-        if (triggered)
+        if (motion_event || imu_event || manual_event)
         {
-            std::string trigger_name;
-            double confidence = 0.80;
+            std::string trigger;
 
-            if (motion_event && imu_event)
+            if (manual_event)
             {
-                trigger_name = "motion_and_imu_detected";
-                confidence = 0.95;
+                trigger = "manual_test_trigger";
+            }
+            else if (motion_event && imu_event)
+            {
+                trigger = "motion_and_imu_detected";
             }
             else if (motion_event)
             {
-                trigger_name = "motion_detected";
-                confidence = std::min(0.99, 0.50 + motion_score * 10.0);
-            }
-            else if (imu_event)
-            {
-                trigger_name = "simulated_sudden_acceleration";
-                confidence = 0.85;
+                trigger = "motion_detected";
             }
             else
             {
-                trigger_name = "manual_test_trigger";
-                confidence = 1.00;
+                trigger = "simulated_sudden_acceleration";
             }
 
-            save_event_package(fs::path(output_root),
-                               frame,
-                               pre_event_frames,
-                               sensor_ring,
-                               trigger_name,
-                               confidence,
-                               camera_dev,
-                               i2c_dev,
-                               chip_id,
-                               chip_ok,
-                               chip_error,
-                               motion_score,
-                               sample.accel_mag_g);
+            write_event_files(frame,
+                              motion_score,
+                              accel_mag,
+                              chip_id,
+                              imu_ok,
+                              trigger);
 
-            std::cout << "Prototype complete. One event package generated.\n";
+            std::cout << "Event saved in events/event_001\n";
             return 0;
         }
     }
 
-    std::cout << "No event triggered before frame limit.\n";
-    std::cout << "Try running with --manual for deterministic testing.\n";
+    std::cout << "No event detected\n";
+    std::cout << "Try running: ./dashcam --manual\n";
 
     return 0;
 }
