@@ -1,281 +1,216 @@
-#include <opencv2/opencv.hpp>
-
-#include <linux/i2c-dev.h>
-#include <sys/ioctl.h>
 #include <fcntl.h>
+#include <linux/videodev2.h>
+#include <poll.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
-#include <iostream>
-#include <fstream>
-#include <filesystem>
-#include <chrono>
-#include <ctime>
-#include <iomanip>
-#include <sstream>
-#include <cmath>
+#include <cerrno>
 #include <cstring>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <vector>
 
-namespace fs = std::filesystem;
+struct Buffer {
+    void *start = nullptr;
+    size_t length = 0;
+};
 
-#define CAMERA_DEVICE "/dev/video0"
-#define I2C_DEVICE    "/dev/i2c-8"
-#define IMU_ADDRESS   0x68
-#define CHIP_ID_REG   0x00
-#define EXPECTED_ID   0x24
-
-std::string get_time()
+static int xioctl(int fd, unsigned long request, void *arg)
 {
-    auto now = std::chrono::system_clock::now();
-    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    int ret;
+    do {
+        ret = ioctl(fd, request, arg);
+    } while (ret == -1 && errno == EINTR);
 
-    std::tm tm_buf {};
-    localtime_r(&t, &tm_buf);
-
-    std::ostringstream ss;
-    ss << std::put_time(&tm_buf, "%Y-%m-%dT%H:%M:%S");
-    return ss.str();
+    return ret;
 }
 
-bool read_imu_chip_id(unsigned char& chip_id)
+static uint32_t fourcc_from_string(const std::string &s)
 {
-    int fd = open(I2C_DEVICE, O_RDWR);
-
-    if (fd < 0)
-    {
-        std::cout << "Failed to open I2C device\n";
-        return false;
+    if (s.size() != 4) {
+        return 0;
     }
 
-    if (ioctl(fd, I2C_SLAVE, IMU_ADDRESS) < 0)
-    {
-        std::cout << "Failed to select IMU address\n";
-        close(fd);
-        return false;
-    }
-
-    unsigned char reg = CHIP_ID_REG;
-
-    if (write(fd, &reg, 1) != 1)
-    {
-        std::cout << "Failed to write chip ID register\n";
-        close(fd);
-        return false;
-    }
-
-    if (read(fd, &chip_id, 1) != 1)
-    {
-        std::cout << "Failed to read chip ID\n";
-        close(fd);
-        return false;
-    }
-
-    close(fd);
-    return true;
+    return v4l2_fourcc(s[0], s[1], s[2], s[3]);
 }
 
-double calculate_motion(cv::Mat& frame, cv::Mat& previous_gray)
+static std::string make_filename(const std::string &folder, int frame_num)
 {
-    cv::Mat gray;
-    cv::Mat diff;
-    cv::Mat mask;
-
-    cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
-    cv::GaussianBlur(gray, gray, cv::Size(5, 5), 0);
-
-    if (previous_gray.empty())
-    {
-        previous_gray = gray.clone();
-        return 0.0;
-    }
-
-    cv::absdiff(previous_gray, gray, diff);
-    cv::threshold(diff, mask, 25, 255, cv::THRESH_BINARY);
-
-    double changed_pixels = cv::countNonZero(mask);
-    double total_pixels = mask.total();
-
-    previous_gray = gray.clone();
-
-    return changed_pixels / total_pixels;
+    std::ostringstream oss;
+    oss << folder << "/frame_"
+        << std::setw(3) << std::setfill('0') << frame_num
+        << ".raw";
+    return oss.str();
 }
 
-void write_event_files(cv::Mat& frame,
-                       double motion_score,
-                       double accel_mag,
-                       unsigned char chip_id,
-                       bool imu_ok,
-                       std::string trigger)
+int main(int argc, char **argv)
 {
-    fs::create_directories("events/event_001");
+    std::string device = argc > 1 ? argv[1] : "/dev/video0";
+    std::string folder = argc > 2 ? argv[2] : "./csi_frames";
+    int width = argc > 3 ? std::stoi(argv[3]) : 640;
+    int height = argc > 4 ? std::stoi(argv[4]) : 480;
+    std::string fmt_str = argc > 5 ? argv[5] : "NV12";
+    int frame_count = argc > 6 ? std::stoi(argv[6]) : 10;
 
-    cv::imwrite("events/event_001/frame.jpg", frame);
+    uint32_t pixfmt = fourcc_from_string(fmt_str);
 
-    std::ofstream csv("events/event_001/sensor.csv");
-    csv << "timestamp,motion_score,accel_mag_g,imu_source\n";
-    csv << get_time() << ","
-        << motion_score << ","
-        << accel_mag << ","
-        << "simulated_after_chip_id_check\n";
-    csv.close();
-
-    std::ofstream json("events/event_001/event.json");
-    json << "{\n";
-    json << "  \"timestamp\": \"" << get_time() << "\",\n";
-    json << "  \"trigger\": \"" << trigger << "\",\n";
-    json << "  \"confidence\": 0.85,\n";
-
-    json << "  \"camera\": {\n";
-    json << "    \"device\": \"/dev/video0\",\n";
-    json << "    \"file\": \"frame.jpg\"\n";
-    json << "  },\n";
-
-    json << "  \"imu\": {\n";
-    json << "    \"bus\": \"/dev/i2c-8\",\n";
-    json << "    \"address\": \"0x68\",\n";
-
-    if (imu_ok)
-    {
-        json << "    \"chip_id\": \"0x"
-             << std::hex
-             << static_cast<int>(chip_id)
-             << "\",\n";
-    }
-    else
-    {
-        json << "    \"chip_id\": \"unavailable\",\n";
-    }
-
-    json << "    \"accel_source\": \"simulated\"\n";
-    json << "  },\n";
-
-    json << "  \"files\": [\"frame.jpg\", \"sensor.csv\"]\n";
-    json << "}\n";
-    json.close();
-
-    std::ofstream log("events/event_001/debug.log");
-    log << "Event created at " << get_time() << "\n";
-    log << "Trigger: " << trigger << "\n";
-    log << "Motion score: " << motion_score << "\n";
-    log << "Acceleration magnitude: " << accel_mag << "\n";
-    log << "IMU verified: " << (imu_ok ? "yes" : "no") << "\n";
-    log.close();
-}
-
-int main(int argc, char* argv[])
-{
-    bool manual_trigger = false;
-
-    if (argc > 1)
-    {
-        std::string arg = argv[1];
-
-        if (arg == "--manual")
-        {
-            manual_trigger = true;
-        }
-    }
-
-    std::cout << "Starting simple dashcam prototype\n";
-
-    unsigned char chip_id = 0;
-    bool imu_ok = read_imu_chip_id(chip_id);
-
-    if (imu_ok && chip_id == EXPECTED_ID)
-    {
-        std::cout << "BMI270 verified. Chip ID = 0x24\n";
-    }
-    else
-    {
-        std::cout << "IMU chip ID check failed or unexpected\n";
-    }
-
-    cv::VideoCapture camera(CAMERA_DEVICE, cv::CAP_V4L2);
-
-    if (!camera.isOpened())
-    {
-        std::cout << "Failed to open camera\n";
+    if (pixfmt == 0 || frame_count <= 0) {
+        std::cerr << "Usage: " << argv[0]
+                  << " /dev/videoX output_folder width height FOURCC frame_count\n";
+        std::cerr << "Example: " << argv[0]
+                  << " /dev/video0 ./csi_frames 640 480 NV12 10\n";
         return 1;
     }
 
-    camera.set(cv::CAP_PROP_FRAME_WIDTH, 640);
-    camera.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
-    camera.set(cv::CAP_PROP_FPS, 30);
+    int fd = open(device.c_str(), O_RDWR);
+    if (fd < 0) {
+        std::cerr << "open failed: " << strerror(errno) << "\n";
+        return 1;
+    }
 
-    cv::Mat frame;
-    cv::Mat previous_gray;
+    v4l2_capability cap {};
+    if (xioctl(fd, VIDIOC_QUERYCAP, &cap) < 0) {
+        std::cerr << "VIDIOC_QUERYCAP failed: " << strerror(errno) << "\n";
+        close(fd);
+        return 1;
+    }
 
-    const double MOTION_THRESHOLD = 0.02;
-    const double ACCEL_THRESHOLD = 1.70;
+    std::cout << "Driver: " << cap.driver << "\n";
+    std::cout << "Card:   " << cap.card << "\n";
 
-    for (int frame_count = 0; frame_count < 200; frame_count++)
-    {
-        camera >> frame;
+    if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE) &&
+        !(cap.device_caps & V4L2_CAP_VIDEO_CAPTURE)) {
+        std::cerr << "This node does not look like a single-planar capture device.\n";
+        std::cerr << "Try another /dev/videoX node from v4l2-ctl --list-devices.\n";
+        close(fd);
+        return 1;
+    }
 
-        if (frame.empty())
-        {
-            std::cout << "Empty camera frame\n";
-            continue;
+    v4l2_format fmt {};
+    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    fmt.fmt.pix.width = width;
+    fmt.fmt.pix.height = height;
+    fmt.fmt.pix.pixelformat = pixfmt;
+    fmt.fmt.pix.field = V4L2_FIELD_NONE;
+
+    if (xioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
+        std::cerr << "VIDIOC_S_FMT failed: " << strerror(errno) << "\n";
+        close(fd);
+        return 1;
+    }
+
+    std::cout << "Format set: "
+              << fmt.fmt.pix.width << "x" << fmt.fmt.pix.height
+              << " " << fmt_str
+              << " sizeimage=" << fmt.fmt.pix.sizeimage << "\n";
+
+    v4l2_requestbuffers req {};
+    req.count = 4;
+    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    req.memory = V4L2_MEMORY_MMAP;
+
+    if (xioctl(fd, VIDIOC_REQBUFS, &req) < 0) {
+        std::cerr << "VIDIOC_REQBUFS failed: " << strerror(errno) << "\n";
+        close(fd);
+        return 1;
+    }
+
+    std::vector<Buffer> buffers(req.count);
+
+    for (unsigned int i = 0; i < req.count; i++) {
+        v4l2_buffer buf {};
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        buf.index = i;
+
+        if (xioctl(fd, VIDIOC_QUERYBUF, &buf) < 0) {
+            std::cerr << "VIDIOC_QUERYBUF failed: " << strerror(errno) << "\n";
+            close(fd);
+            return 1;
         }
 
-        double motion_score = calculate_motion(frame, previous_gray);
+        buffers[i].length = buf.length;
+        buffers[i].start = mmap(nullptr,
+                                buf.length,
+                                PROT_READ | PROT_WRITE,
+                                MAP_SHARED,
+                                fd,
+                                buf.m.offset);
 
-        double ax = 0.02;
-        double ay = 0.01;
-        double az = 1.00;
-
-        if (frame_count == 80)
-        {
-            ax = 2.20;
-            ay = 0.10;
-            az = 1.00;
+        if (buffers[i].start == MAP_FAILED) {
+            std::cerr << "mmap failed: " << strerror(errno) << "\n";
+            close(fd);
+            return 1;
         }
 
-        double accel_mag = std::sqrt((ax * ax) + (ay * ay) + (az * az));
-
-        bool motion_event = motion_score > MOTION_THRESHOLD;
-        bool imu_event = accel_mag > ACCEL_THRESHOLD;
-        bool manual_event = manual_trigger && frame_count == 20;
-
-        std::cout << "frame=" << frame_count
-                  << " motion=" << motion_score
-                  << " accel=" << accel_mag
-                  << "\n";
-
-        if (motion_event || imu_event || manual_event)
-        {
-            std::string trigger;
-
-            if (manual_event)
-            {
-                trigger = "manual_test_trigger";
-            }
-            else if (motion_event && imu_event)
-            {
-                trigger = "motion_and_imu_detected";
-            }
-            else if (motion_event)
-            {
-                trigger = "motion_detected";
-            }
-            else
-            {
-                trigger = "simulated_sudden_acceleration";
-            }
-
-            write_event_files(frame,
-                              motion_score,
-                              accel_mag,
-                              chip_id,
-                              imu_ok,
-                              trigger);
-
-            std::cout << "Event saved in events/event_001\n";
-            return 0;
+        if (xioctl(fd, VIDIOC_QBUF, &buf) < 0) {
+            std::cerr << "VIDIOC_QBUF failed: " << strerror(errno) << "\n";
+            close(fd);
+            return 1;
         }
     }
 
-    std::cout << "No event detected\n";
-    std::cout << "Try running: ./dashcam --manual\n";
+    v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 
+    if (xioctl(fd, VIDIOC_STREAMON, &type) < 0) {
+        std::cerr << "VIDIOC_STREAMON failed: " << strerror(errno) << "\n";
+        close(fd);
+        return 1;
+    }
+
+    for (int frame = 0; frame < frame_count; frame++) {
+        pollfd pfd {};
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+
+        int pret = poll(&pfd, 1, 2000);
+        if (pret <= 0) {
+            std::cerr << "poll timeout or error\n";
+            break;
+        }
+
+        v4l2_buffer buf {};
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+
+        if (xioctl(fd, VIDIOC_DQBUF, &buf) < 0) {
+            std::cerr << "VIDIOC_DQBUF failed: " << strerror(errno) << "\n";
+            break;
+        }
+
+        std::string filename = make_filename(folder, frame);
+        std::ofstream out(filename, std::ios::binary);
+
+        if (!out) {
+            std::cerr << "Could not open output file: " << filename << "\n";
+            break;
+        }
+
+        out.write(static_cast<char *>(buffers[buf.index].start),
+                  static_cast<std::streamsize>(buf.bytesused));
+
+        std::cout << "Saved " << filename
+                  << " bytes=" << buf.bytesused
+                  << " buffer_index=" << buf.index << "\n";
+
+        if (xioctl(fd, VIDIOC_QBUF, &buf) < 0) {
+            std::cerr << "VIDIOC_QBUF requeue failed: " << strerror(errno) << "\n";
+            break;
+        }
+    }
+
+    xioctl(fd, VIDIOC_STREAMOFF, &type);
+
+    for (auto &b : buffers) {
+        if (b.start && b.start != MAP_FAILED) {
+            munmap(b.start, b.length);
+        }
+    }
+
+    close(fd);
     return 0;
 }
