@@ -1,14 +1,1 @@
-double ax = 0.0;
-double ay = 0.0;
-double az = 0.0;
-
-bool accel_ok = read_real_accel(ax, ay, az);
-
-if (!accel_ok)
-{
-    std::cout << "Real accel read failed, using fallback values\n";
-
-    ax = 0.0;
-    ay = 0.0;
-    az = 1.0;
-}
+faf
